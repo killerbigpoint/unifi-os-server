@@ -1,0 +1,105 @@
+name: Check for new Network application release
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Check daily; this queries Ubiquiti's Firmware Update Service.
+    - cron: "15 6 * * *"
+
+permissions:
+  contents: write
+  packages: read
+  pull-requests: write
+
+jobs:
+  network-app-release-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read pinned versions and base image
+        id: pinned
+        run: |
+          set -euo pipefail
+          UOSSERVER_IMAGE=$(awk '$1 == "FROM" {print $2; exit}' Dockerfile)
+          NETWORK_APP_VERSION=$(awk -F= '/^ARG NETWORK_APP_VERSION=/ {print $2}' Dockerfile)
+          APP_VERSION=$(awk -F '"' '/^ENV APP_VERSION=/ {print $2}' Dockerfile)
+          if [ -z "$UOSSERVER_IMAGE" ] || [ -z "$NETWORK_APP_VERSION" ] || [ -z "$APP_VERSION" ]; then
+            echo "Could not parse FROM, APP_VERSION, or NETWORK_APP_VERSION from Dockerfile" >&2
+            exit 1
+          fi
+          {
+            echo "uosserver_image=$UOSSERVER_IMAGE"
+            echo "network_app_version=$NETWORK_APP_VERSION"
+            echo "app_version=$APP_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Pull UOS base image
+        env:
+          UOSSERVER_IMAGE: ${{ steps.pinned.outputs.uosserver_image }}
+        run: docker pull --platform linux/amd64 "$UOSSERVER_IMAGE"
+
+      - name: Discover latest compatible Network application version
+        id: discover
+        env:
+          UOSSERVER_IMAGE: ${{ steps.pinned.outputs.uosserver_image }}
+          APP_VERSION: ${{ steps.pinned.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          # The uos CLI reads these files to identify the UOS release/platform
+          # when querying FUS. Recreate the runtime metadata in this probe.
+          version=$(docker run --rm --platform linux/amd64 \
+            --entrypoint /bin/sh \
+            -e APP_VERSION="$APP_VERSION" \
+            "$UOSSERVER_IMAGE" -c '
+              echo "UOSSERVER.0000000.${APP_VERSION}.0000000.000000.0000" > /usr/lib/version
+              [ -s /usr/lib/platform ] || echo linux-x64 > /usr/lib/platform
+              exec /usr/bin/uos runnable latest-versions unifi
+            ' | jq -er '.release.version // empty')
+          if [ -z "$version" ]; then
+            echo "FUS returned no Network release for ${UOSSERVER_IMAGE}" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Latest compatible Network version: $version"
+
+      - name: Compare with pinned Network version
+        id: compare
+        env:
+          PINNED: ${{ steps.pinned.outputs.network_app_version }}
+          UPSTREAM: ${{ steps.discover.outputs.version }}
+        run: |
+          if [ "$PINNED" = "$UPSTREAM" ]; then
+            echo "Network version $PINNED is already current"
+            echo "should_pr=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New Network version detected: $UPSTREAM (pinned: $PINNED)"
+            echo "should_pr=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update pinned Network version
+        if: steps.compare.outputs.should_pr == 'true'
+        env:
+          UPSTREAM: ${{ steps.discover.outputs.version }}
+        run: |
+          sed -i "s|^ARG NETWORK_APP_VERSION=.*|ARG NETWORK_APP_VERSION=${UPSTREAM}|" Dockerfile
+
+      - name: Open or update pull request
+        if: steps.compare.outputs.should_pr == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: bump UniFi Network to ${{ steps.discover.outputs.version }}"
+          branch: bump/network-app-${{ steps.discover.outputs.version }}
+          base: main
+          title: "Update UniFi Network to ${{ steps.discover.outputs.version }}"
+          body: |
+            Automated version update detected through Ubiquiti's Firmware Update Service.
+
+            - `NETWORK_APP_VERSION` → `${{ steps.discover.outputs.version }}`
+            - Compatible UniFi OS Server version: `${{ steps.pinned.outputs.app_version }}`
+
+            The Docker image will install this package during the image build using
+            Ubiquiti's own `uos runnable install` command.
